@@ -1,96 +1,137 @@
-#include "sparse_mat.hpp"
+#include "hip_sparse_mat.hpp"
 #include "par_binary_IO.hpp"
 #include "hip_utils.hpp"
 
-/* ========================================================
 
-           Linear algebra operations
+// NOTE: this file is a work in progress for combining hip computation and point to point communication (which exists in two difference branches as no one seperated the code into different files, just over wrote the original code)
 
-=========================================================*/
+__global__ void pack(
+    const double* __restrict__ x,
+    const int* __restrict__ idx,
+    double* __restrict__ packed_buf,
+    int n
+) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) packed_buf[i] = x[idx[i]];
+}
 
-/* 
+
+/**
 Function call to rocsparse_spmv to perform sparse matrix-vector multiplication on device.
-@args - handle: rocsparse handle
-        A: rocsparse sparse matrix descriptor
-        alpha: scalar multiplier for A*x
-        x: rocsparse dense vector descriptor for input vector
-        beta: scalar multiplier for y
-        y: rocsparse dense vector descriptor for output vector
-        tmp_buffer_size: size of temporary buffer for rocsparse_spmv
-        tmp_buffer: pointer to temporary buffer for rocsparse_spmv
+@args
+- handle: rocsparse handle
+- A: rocsparse sparse matrix descriptor
+- alpha: scalar multiplier for A*x
+- x: rocsparse dense vector descriptor for input vector
+- beta: scalar multiplier for y
+- y: rocsparse dense vector descriptor for output vector
+- tmp_buffer_size: size of temporary buffer for rocsparse_spmv
+- tmp_buffer: pointer to temporary buffer for rocsparse_spmv
 
 */
-void roc_spmv(
+void local_spmv(
     rocsparse_handle handle, rocsparse_spmat_descr A,
     double alpha, rocsparse_dnvec_descr x, 
     double beta, rocsparse_dnvec_descr y,
     size_t tmp_buffer_size, void* tmp_buffer
 ) {
-    ROCSPARSE_CHECK(rocsparse_spmv(handle, rocsparse_operation_none,
+    ROCSPARSE_CHECK(
+        rocsparse_spmv(
+            handle, rocsparse_operation_none,
             &alpha, A, x, &beta, y, 
             rocsparse_datatype_f64_r,
             rocsparse_spmv_alg_default,
             rocsparse_spmv_stage_compute,
-            &tmp_buffer_size, tmp_buffer));
+            &tmp_buffer_size, tmp_buffer
+        )
+    );
 }
 
-/* 
-Parallel SpMV b = alpha*A*x + beta*b (point to point version).
 
-@args - alpha: scalar multiplier for A*x
-        A: ParMat object containing the distributed matrix
-        x: input vector (local portion)
-        beta: scalar multiplier for b
-        b: output vector (local portion)
+
+/**
+Parallel SpMV: b = alpha*A*x + beta*b (point to point version).
+
+@args
+- alpha: scalar multiplier for A*x
+- A: ParMat object containing the distributed matrix
+- x_d: input vector (local portion)
+- vec_x: rocsparse dense vector descriptor for input vector
+- beta: scalar multiplier for b
+- b_d: output vector (local portion)
+- vec_b: rocsparse dense vector descriptor for output vector
+- sendbuf: buffer for sending data
+- recvbuf: buffer for receiving data
+- vec_recv: rocsparse dense vector descriptor for received data
 */
-void ptp_spmv(
-    double alpha, ParMat& A,
-    double* x_d, rocsparse_dnvec_descr vec_x,
+void parallel_spmv(
+    double alpha, ParMat& A, double* x_d, rocsparse_dnvec_descr vec_x, 
     double beta, double* b_d, rocsparse_dnvec_descr vec_b,
-    double* sendbuf, double* recvbuf, rocsparse_dnvec_descr vec_recv)
-{
+    double* sendbuf, double* recvbuf, rocsparse_dnvec_descr vec_recv
+) {
     int proc, start, end;
     int tag = 0;
 
-     // Launch Pack Kernel -- Pack Send Buffer
+    // Launch Pack Kernel -- Pack Send Buffer
     if (A.send_comm.size_msgs) {
         dim3 threads(256);
         dim3 blocks((A.send_comm.size_msgs + threads.x - 1) / threads.x);
-        pack<<<blocks, threads, 0, 0>>>(x_d, (const int*)A.send_comm.d_idx,
-                sendbuf, A.send_comm.size_msgs);
+        pack<<<blocks, threads, 0, 0>>>(
+            x_d,
+            (const int*)A.send_comm.d_idx,
+            sendbuf,
+            A.send_comm.size_msgs
+        );
         HIP_CHECK(hipStreamSynchronize(0));
     }
 
+    // Initialize Receive Requests
     for (int i = 0; i < A.recv_comm.n_msgs; i++) {
         proc  = A.recv_comm.procs[i];
         start = A.recv_comm.ptr[i];
         end   = A.recv_comm.ptr[i + 1];
-        MPI_Irecv(&(recvbuf[start]),
-                  (int)(end - start),
-                  MPI_DOUBLE,
-                  proc,
-                  tag,
-                  MPI_COMM_WORLD,
-                  &(A.recv_comm.req[i]));
+        MPI_Irecv(
+            &(recvbuf[start]),
+            (int)(end - start),
+            MPI_DOUBLE,
+            proc,
+            tag,
+            MPI_COMM_WORLD,
+            &(A.recv_comm.req[i])
+        );
     }
 
+    // Initialize Send Requests
     for (int i = 0; i < A.send_comm.n_msgs; i++) {
         proc  = A.send_comm.procs[i];
         start = A.send_comm.ptr[i];
         end   = A.send_comm.ptr[i + 1];
         for (int j = start; j < end; j++)
             sendbuf[j] = x[A.send_comm.idx[j]];
-        MPI_Isend(&(sendbuf[start]),
-                  (int)(end - start),
-                  MPI_DOUBLE,
-                  proc,
-                  tag,
-                  MPI_COMM_WORLD,
-                  &(A.send_comm.req[i]));
+        MPI_Isend(
+            &(sendbuf[start]),
+            (int)(end - start),
+            MPI_DOUBLE,
+            proc,
+            tag,
+            MPI_COMM_WORLD,
+            &(A.send_comm.req[i])
+        );
     }
 
-    roc_spmv(alpha, A.on_proc, x, beta, b);
+    // perform local computation
+    local_spmv(
+        A.sparse_handle,
+        A.d_on_proc.descr,
+        alpha,
+        vec_x, 
+        beta,
+        vec_b,
+        A.d_on_proc.buf_size,
+        A.d_on_proc.buffer
+    );
 
+    // wait for all communication to complete
     if (A.recv_comm.n_msgs)
     {
         MPI_Waitall(A.recv_comm.n_msgs, A.recv_comm.req.data(), MPI_STATUSES_IGNORE);
@@ -101,7 +142,17 @@ void ptp_spmv(
         MPI_Waitall(A.send_comm.n_msgs, A.send_comm.req.data(), MPI_STATUSES_IGNORE);
     }
 
-    roc_spmv(alpha, A.off_proc, recvbuf, 1.0, b);
+    // perform off-process computation
+    local_spmv(
+        A.sparse_handle,
+        A.d_off_proc.descr,
+        alpha,
+        vec_recv,
+        1.0,
+        vec_b,
+        A.d_off_proc.buf_size,
+        A.d_off_proc.buffer
+    );
 
 }
 
@@ -143,30 +194,6 @@ void CG(
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-    // 1. Initialize CG Variables and Descriptors
-    
-    double *r, *p, *Ap;
-    rocsparse_dnvec_descr vec_r, vec_p, vec_Ap;
-
-    HIP_CHECK(hipMalloc((void**)&r, A_local_rows*sizeof(double)));
-    HIP_CHECK(hipMalloc((void**)&p, A_local_rows*sizeof(double)));
-    HIP_CHECK(hipMalloc((void**)&Ap, A_local_rows*sizeof(double)));
-
-    ROCSPARSE_CHECK(
-        rocsparse_create_dnvec_descr(
-        &vec_r, A.local_rows, r, rocsparse_datatype_f64_r
-        )
-    );
-    ROCSPARSE_CHECK(
-        rocsparse_create_dnvec_descr(
-        &vec_p, A.local_rows, p, rocsparse_datatype_f64_r
-        )
-    );
-    ROCSPARSE_CHECK(
-        rocsparse_create_dnvec_descr(
-        &vec_Ap, A.local_rows, Ap, rocsparse_datatype_f64_r
-        )
-    );
 
     // Set b to random values, x to 0
     srand(time(NULL) + rank);
@@ -248,39 +275,81 @@ void CG(
 }
 
 
+
+/* 
+  This function reads the matrix stored in a file in par_binary format???
+  It returns the time taken to read the matrix.
+*/
+double read_matrix(const char* filename, ParMat& A) {
+    
+    return tfinal;
+}
+
+
+/* 
+  This function calls form_comm to set up the communication patterns for the matrix.
+  It returns the time taken to set up the communication patterns.
+
+*/
+double setup_comm_patterns(ParMat& A) {
+    double t0 = MPI_Wtime();
+    double tfinal;
+    
+    return tfinal;
+}
+
+
 /* MAIN
     @args - filename: path to matrix file in par_binary format??? (default: "Dubcova2.pm")
 */
 int main(int argc, char* argv[]) {
+    // Initialize MPI
     MPI_Init(&argc, &argv);
     int rank, num_procs;
+    double t0, tfinal;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-    // 1. Read in the matrix
+    /* 
+      Read in the matrix 
+      
+    */
     const char* filename = "Dubcova2.pm";
     if (argc > 1) filename = argv[1];
 
     ParMat A;
     MPI_Barrier(MPI_COMM_WORLD);
+    
     t0 = MPI_Wtime();
+    
     readParMatrix(filename, A);
+    
     tfinal = MPI_Wtime() - t0;
     MPI_Allreduce(&tfinal, &t0, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    if (rank == 0) printf("Read matrix: %e\n", t0);
+    
+    if (rank == 0) printf("Read matrix: %e\n", read_matrix_time);
     fflush(stdout);
 
-    // 2. Form communication patterns
+    /*
+      Form communication patterns 
+      
+    */
     MPI_Barrier(MPI_COMM_WORLD);
     t0 = MPI_Wtime();
+    
     form_comm(A);
+    
     tfinal = MPI_Wtime() - t0;
     MPI_Allreduce(&tfinal, &t0, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-    if (rank == 0) printf("Form comm: %e\n", t0);
+    
+    if (rank == 0) printf("Form comm: %e\n", setup_comm_time);
     fflush(stdout);
 
-    // 3. Copy matrix to device and initialize buffers
-    copy_to_device(A);
+    /*
+      Copy matrix to device and initialize dense vector buffers 
+      
+      */
+    copy_to_device(A); // this is a function in hip_sparse_mat.hpp
 
     std::vector<double> x(A.local_cols);
     std::vector<double> b(A.local_rows);
@@ -289,6 +358,11 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipMalloc((void**)&b_d, A.local_rows*sizeof(double)));
     HIP_CHECK(hipMalloc((void**)&r_d, A.local_rows*sizeof(double)));
 
+
+    /*
+      Initialize send and receive buffers
+    
+      */
     double* sendbuf = NULL;
     double* recvbuf = NULL;
 
@@ -301,7 +375,10 @@ int main(int argc, char* argv[]) {
                 A.recv_comm.size_msgs*sizeof(double)));
     }
 
-    // 4. Initialize device descriptors for x, b, r, and recv buffer
+    /*
+      Initialize device descriptors for dense vectors x, b, r, and recv buffer
+    
+    */
     rocsparse_dnvec_descr vec_x, vec_b, vec_r, vec_recv;
     ROCSPARSE_CHECK(
         rocsparse_create_dnvec_descr(
@@ -321,46 +398,71 @@ int main(int argc, char* argv[]) {
     );
 
 
-    // 5. Initialize SpMV Buffers
-    double one = 1.0;
+    /*
+      Initialize SpMV Buffers
+
+      Two rocsparse_spmv calls with rocsparse_spmv_stage_buffer_size
+        (one for d_on_proc, one for d_off_proc × vec_recv)
+        to query how much scratch space rocsparse needs,
+        then hipMalloc those buffers and store them on the GPUMat structs.
+
+      on_proc = data owned by this process
+      off_proc = data owned by another process
+    */
+    double one = 1.0; // ???
     double zero = 0.0;
-    ROCSPARSE_CHECK(rocsparse_spmv(A.sparse_handle, 
+    // call rocsparse_spmv to figure out the buffer size needed
+    ROCSPARSE_CHECK(
+        rocsparse_spmv(
+            A.sparse_handle, 
             rocsparse_operation_none,
             &one, A.d_on_proc.descr, vec_x, &zero, vec_b,
             rocsparse_datatype_f64_r,
             rocsparse_spmv_alg_default,
             rocsparse_spmv_stage_buffer_size,
-            &A.d_on_proc.buf_size, NULL));
-    if (A.d_on_proc.buf_size)
-    {
+            &A.d_on_proc.buf_size, NULL
+        )
+    );
+
+    // if buffer size is non-zero, allocate device memory for the buffer
+    if (A.d_on_proc.buf_size) {
         HIP_CHECK(hipMalloc(&A.d_on_proc.buffer,
             A.d_on_proc.buf_size));
     }
-    ROCSPARSE_CHECK(rocsparse_spmv(A.sparse_handle, 
+    // repeat for off-proc
+    ROCSPARSE_CHECK(
+        rocsparse_spmv(
+            A.sparse_handle, 
             rocsparse_operation_none,
             &one, A.d_off_proc.descr, vec_recv, &zero, vec_b,
             rocsparse_datatype_f64_r,
             rocsparse_spmv_alg_default,
             rocsparse_spmv_stage_buffer_size,
-            &A.d_off_proc.buf_size, NULL)); 
-    if (A.d_off_proc.buf_size)
-    {
+            &A.d_off_proc.buf_size, NULL
+        )
+    ); 
+    if (A.d_off_proc.buf_size) {
         HIP_CHECK(hipMalloc(&A.d_off_proc.buffer,
                 A.d_off_proc.buf_size));
     }
 
-    // 6. Initialize x
-    // Set x to random values, b = A*x
-    // Will reset x to 0 before each CG
+    /*
+      Initialize x
+      
+      Set x to random values, b = A*x
+      Will reset x to 0 before each CG 
+      
+      */
     double alpha = 1.0;
     double beta = 0.0;
     std::mt19937 rng(rank + 12345);
     std::uniform_real_distribution<double> dist(0.0, 1.0);
-    std::generate(x.begin(), x.end(),
-              [&]() { return dist(rng); });
-    HIP_CHECK(hipMemcpy(x_d, x.data(), x.size() * sizeof(double),
-            hipMemcpyHostToDevice));
-    ptp_spmv(
+    std::generate(x.begin(), x.end(), [&]() { return dist(rng); });
+    HIP_CHECK(
+        hipMemcpy(x_d, x.data(), x.size() * sizeof(double), hipMemcpyHostToDevice)
+    );
+    // compute b = A*x
+    parallel_spmv(
         alpha, A, x_d, vec_x,
         beta, b_d, vec_b,
         sendbuf, recvbuf, vec_recv
@@ -368,7 +470,18 @@ int main(int argc, char* argv[]) {
 
 
 
-   
+    // time the CG iterations
+    int n_iters;
+    int conv_iter;
+    std::vector<double> r;
+    double sum;
+    double local_norm_b, norm_b;
+    norm_b = inner_product(
+        A.blas_handle, A.local_rows, b_d,
+        b_d, &local_norm_b, &norm_b, NULL
+    );
+    norm_b = sqrt(norm_b);
+    if (rank == 0) printf("norm b %e\n", norm_b);
 
     if (rank == 0) 
     {
@@ -379,5 +492,19 @@ int main(int argc, char* argv[]) {
         printf("2 Norm of Residual: %lg\n\n", norm_r);
     }
 
+
+    // finalize
+    ROCSPARSE_CHECK(rocsparse_destroy_dnvec_descr(vec_x));
+    ROCSPARSE_CHECK(rocsparse_destroy_dnvec_descr(vec_b));
+    ROCSPARSE_CHECK(rocsparse_destroy_dnvec_descr(vec_r));
+    ROCSPARSE_CHECK(rocsparse_destroy_dnvec_descr(vec_recv));
+
+    HIP_CHECK(hipFree(x_d));
+    HIP_CHECK(hipFree(b_d));
+    HIP_CHECK(hipFree(r_d));
+    HIP_CHECK(hipFree(sendbuf));
+    HIP_CHECK(hipFree(recvbuf));
+
     MPI_Finalize();
+    return 0;
 }
