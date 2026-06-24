@@ -5,7 +5,7 @@
 
 #include <vector>
 
-#include "utils.hpp"
+#include "hip_utils.hpp"
 
 struct GPUMat
 {

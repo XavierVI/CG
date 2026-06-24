@@ -39,3 +39,9 @@
 
 # debug information files
 *.dwo
+
+*.gz
+*.txt
+*.mat
+*.rb
+build/
