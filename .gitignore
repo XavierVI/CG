@@ -39,9 +39,16 @@
 
 # debug information files
 *.dwo
+*.core
 
 *.gz
 *.txt
 *.mat
 *.rb
 build/
+
+*.mtx
+*.petsc
+matrices/
+*.pyc
+*.json

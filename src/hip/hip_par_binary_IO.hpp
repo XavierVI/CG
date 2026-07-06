@@ -19,10 +19,7 @@
 #include "hip_sparse_mat.hpp"
 
 /* 
-This file defines the functions required to read a matrix stored in ??????? format.
-
-
-
+This file defines the functions required to read a matrix stored in PETSc format.
 
 */
 

@@ -356,7 +356,7 @@ int main(int argc, char* argv[]) {
       Read in the matrix
 
     */
-    const char* filename = "Dubcova2.pm";
+    const char* filename = "../matrices/Dubcova2.petsc";
     if (argc > 1) filename = argv[1];
 
     ParMat A;
