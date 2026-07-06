@@ -11,7 +11,7 @@ rm -rf build/
 mkdir build
 cd build
 
-hipcc -o ./hip-cg ../src/hip_cg.cpp \
+hipcc -o ./hip-cg ../src/hip/hip_cg.cpp \
   -I${CRAY_MPICH_DIR}/include \
   -L${CRAY_MPICH_DIR}/lib -lmpi \
   -lnuma \
