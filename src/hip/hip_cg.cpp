@@ -5,6 +5,7 @@
 #include <random>
 #include <caliper/cali.h>
 // #include <caliper/cali-manager.h>
+#include <adiak.hpp>
 
 // NOTE: this file is a work in progress for combining hip computation and point to point communication (which exists in two difference branches as no one seperated the code into different files, just over wrote the original code)
 
@@ -368,6 +369,11 @@ int main(int argc, char* argv[]) {
     // Initialize MPI
     MPI_Init(&argc, &argv);
     save_node_topology(MPI_COMM_WORLD);
+    MPI_Comm adk_comm = MPI_COMM_WORLD;
+    adiak::init(&adk_comm);
+    // save job ID
+    adiak::value("run_id", getenv("FLUX_JOB_ID") ? getenv("FLUX_JOB_ID") : "unknown");
+    adiak::value("batch_id", getenv("FLUX_BATCH_JOB_ID") ? getenv("FLUX_BATCH_JOB_ID") : "unknown");
     
     int rank, num_procs;
     double t0, tfinal;
@@ -551,6 +557,7 @@ int main(int argc, char* argv[]) {
     */
     double norm_r;
     int max_iter = 500;
+    double sum;
 
     // synchronize MPI processes and zero out x_d before starting CG
     MPI_Barrier(MPI_COMM_WORLD);
@@ -558,6 +565,17 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipStreamSynchronize(0));
     
     int conv_iters = CG(A, x_d, vec_x, b_d, vec_b, sendbuf, recvbuf, vec_recv, &norm_r, max_iter);
+    spmv(
+        -1.0, A, x_d, vec_x, 1.0, r_d, vec_r,
+        sendbuf, recvbuf, vec_recv
+    );
+    sum = inner_product(
+        A.blas_handle, A.local_rows, r_d,
+        r_d, &local_norm_b, &sum, NULL
+    );
+
+    if (rank == 0) printf("Sum %e\n", sum);
+    if (rank == 0) printf("CG + %s: %d iter, norm %e\n", names[idx], conv_iter, sqrt(sum) / norm_b);
 
     if (rank == 0)
     {
@@ -582,6 +600,7 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipFree(recvbuf));
 
     // mgr.flush();
+    adiak::fini();
     MPI_Finalize();
     return 0;
 }
