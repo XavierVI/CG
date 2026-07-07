@@ -9,6 +9,7 @@
 #include <string>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 
 struct GPUMat
 {
@@ -369,91 +370,253 @@ void assign_node_ids(const std::vector<std::string>& hostnames,
 }
 
 /*
+ * gather_variable_ints
+ * ----------------------
+ * Inputs:
+ *   local - this rank's data (arbitrary length, may differ per rank).
+ *   comm  - MPI communicator to gather over.
+ * Outputs (written by reference, only meaningful on rank 0):
+ *   all_data - concatenation of every rank's `local` vector, in rank order.
+ *   counts   - all_data[displs[r] .. displs[r]+counts[r]) is rank r's slice.
+ *   displs   - offset of rank r's slice into all_data.
+ * Purpose:
+ *   MPI_Gather requires equal-sized sends, but each rank has a different
+ *   number of communication neighbors. This does the two-step
+ *   size-then-data gather (MPI_Gather + MPI_Gatherv) needed for that.
+ */
+void gather_variable_ints(const std::vector<int>& local, MPI_Comm comm,
+                           std::vector<int>& all_data,
+                           std::vector<int>& counts,
+                           std::vector<int>& displs) {
+    int rank, num_procs;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &num_procs);
+
+    int local_n = static_cast<int>(local.size());
+    counts.resize(num_procs);
+    MPI_Gather(&local_n, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, comm);
+
+    displs.assign(num_procs, 0);
+    int total = 0;
+    if (rank == 0) {
+        for (int i = 0; i < num_procs; ++i) {
+            displs[i] = total;
+            total += counts[i];
+        }
+        all_data.resize(total);
+    }
+
+    MPI_Gatherv(local.data(), local_n, MPI_INT,
+                rank == 0 ? all_data.data() : nullptr, counts.data(), displs.data(),
+                MPI_INT, 0, comm);
+}
+
+/*
+ * CommStats / compute_comm_stats
+ * ---------------------------------
+ * Per-rank summary of a ParMat's halo-exchange communication pattern:
+ * how many neighbors it sends to / receives from, the total number of
+ * doubles exchanged, and the min/max single-message size in each
+ * direction. Derived purely from local send_comm/recv_comm state built
+ * by form_comm(), no communication needed.
+ */
+struct CommStats
+{
+    int nrecipients;   // number of ranks this rank sends to (send_comm.n_msgs)
+    int nsenders;      // number of ranks this rank receives from (recv_comm.n_msgs)
+    int sendsize;      // total doubles sent, all neighbors (send_comm.size_msgs)
+    int recvsize;      // total doubles received, all neighbors (recv_comm.size_msgs)
+    int send_msg_min;
+    int send_msg_max;
+    int recv_msg_min;
+    int recv_msg_max;
+};
+
+CommStats compute_comm_stats(const ParMat& A) {
+    CommStats s;
+    s.nrecipients = A.send_comm.n_msgs;
+    s.nsenders    = A.recv_comm.n_msgs;
+    s.sendsize    = A.send_comm.size_msgs;
+    s.recvsize    = A.recv_comm.size_msgs;
+
+    s.send_msg_min = s.nrecipients ? A.send_comm.counts[0] : 0;
+    s.send_msg_max = s.nrecipients ? A.send_comm.counts[0] : 0;
+    for (int c : A.send_comm.counts) {
+        s.send_msg_min = std::min(s.send_msg_min, c);
+        s.send_msg_max = std::max(s.send_msg_max, c);
+    }
+
+    s.recv_msg_min = s.nsenders ? A.recv_comm.counts[0] : 0;
+    s.recv_msg_max = s.nsenders ? A.recv_comm.counts[0] : 0;
+    for (int c : A.recv_comm.counts) {
+        s.recv_msg_min = std::min(s.recv_msg_min, c);
+        s.recv_msg_max = std::max(s.recv_msg_max, c);
+    }
+
+    return s;
+}
+
+/*
  * write_topology_json
  * ---------------------
  * Inputs:
- *   filename    - path to write the JSON file to.
- *   hostnames   - rank-indexed hostnames.
- *   node_ids    - rank-indexed node ids (see assign_node_ids).
- *   local_ranks - rank-indexed local ranks (see assign_node_ids).
+ *   filename                 - path to write the JSON file to.
+ *   hostnames/node_ids/local_ranks - rank-indexed node placement
+ *     (see gather_hostnames / assign_node_ids).
+ *   all_stats  - flattened rank-indexed CommStats, 8 ints per rank in the
+ *     order declared in CommStats (as gathered via plain MPI_Gather).
+ *   send_data/send_counts/send_displs - gathered (neighbor_rank, count)
+ *     pairs per rank for send_comm, as produced by gather_variable_ints
+ *     (counts here are in ints, i.e. 2x the number of neighbor entries).
+ *   recv_data/recv_counts/recv_displs - same, for recv_comm.
  * Purpose:
- *   Serializes the rank/hostname/node/local-rank table to a JSON file
- *   with no external JSON library dependency. Intended to be called by
- *   exactly one rank (rank 0) to avoid concurrent writes to the same path.
+ *   Serializes, per rank, which node it ran on and which ranks it
+ *   exchanges halo data with (and how much), to a JSON file with no
+ *   external JSON library dependency. Intended to be called by exactly
+ *   rank 0.
  */
 void write_topology_json(const std::string& filename,
                           const std::vector<std::string>& hostnames,
                           const std::vector<int>& node_ids,
-                          const std::vector<int>& local_ranks) {
-    int num_procs = static_cast<int>(hostnames.size());    // total rank count
+                          const std::vector<int>& local_ranks,
+                          const std::vector<int>& all_stats,
+                          const std::vector<int>& send_data,
+                          const std::vector<int>& send_counts,
+                          const std::vector<int>& send_displs,
+                          const std::vector<int>& recv_data,
+                          const std::vector<int>& recv_counts,
+                          const std::vector<int>& recv_displs) {
+    int num_procs = static_cast<int>(hostnames.size());
 
-    int num_nodes = 0;                                        // running max node id + 1
-    for (int id : node_ids) {                                  // scan all assigned node ids
-        if (id + 1 > num_nodes) num_nodes = id + 1;               // track the highest id seen
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "save_topology: failed to open " << filename << " for writing\n";
+        return;
     }
 
-    std::ofstream out(filename);                              // open output file, truncating if it exists
-    if (!out.is_open()) {                                      // guard against an unwritable path
-        std::cerr << "save_node_topology: failed to open " << filename << " for writing\n"; // report failure
-        return;                                                  // abort write; caller still proceeds (non-fatal)
-    }
+    // Emits a JSON array of {rank, count, bytes} for one rank's neighbor list.
+    auto write_neighbors = [&out](const std::vector<int>& data, int count, int displ) {
+        int n_entries = count / 2; // each entry is (neighbor_rank, n_doubles)
+        out << "[";
+        for (int i = 0; i < n_entries; ++i) {
+            int neighbor = data[displ + 2 * i];
+            int n_doubles = data[displ + 2 * i + 1];
+            out << "{\"rank\": " << neighbor << ", \"count\": " << n_doubles
+                << ", \"bytes\": " << (static_cast<long>(n_doubles) * sizeof(double)) << "}";
+            if (i + 1 < n_entries) out << ", ";
+        }
+        out << "]";
+    };
 
-    out << "{\n";                                               // start top-level JSON object
-    out << "  \"num_procs\": " << num_procs << ",\n";           // total rank count, for sanity-checking joins later
-    out << "  \"num_nodes\": " << num_nodes << ",\n";           // total distinct nodes used
-    out << "  \"ranks\": [\n";                                  // begin array of per-rank records
+    out << "{\n";
+    out << "  \"comm_size\": " << num_procs << ",\n";
+    out << "  \"element_size_bytes\": " << sizeof(double) << ",\n";
+    out << "  \"ranks\": [\n";
 
-    for (int r = 0; r < num_procs; ++r) {                       // emit one JSON object per rank
+    for (int r = 0; r < num_procs; ++r) {
+        const int* s          = &all_stats[static_cast<size_t>(r) * 8];
+        int nrecipients       = s[0];
+        int nsenders          = s[1];
+        int sendsize          = s[2];
+        int recvsize          = s[3];
+        int send_msg_min      = s[4];
+        int send_msg_max      = s[5];
+        int recv_msg_min      = s[6];
+        int recv_msg_max      = s[7];
+
         out << "    {\n";
-        out << "      \"rank\": " << r << ",\n";                  // MPI rank; join key against Caliper's mpi.rank
-        out << "      \"hostname\": \"" << hostnames[r] << "\",\n"; // node hostname
-        out << "      \"node_id\": " << node_ids[r] << ",\n";     // integer node id, ordered by first appearance
-        out << "      \"local_rank\": " << local_ranks[r] << "\n"; // rank's position among co-located ranks
-        out << "    }" << (r + 1 < num_procs ? "," : "") << "\n"; // comma-separate, no trailing comma on the last entry
+        out << "      \"rank\": " << r << ",\n";
+        out << "      \"hostname\": \"" << hostnames[r] << "\",\n";
+        out << "      \"node_id\": " << node_ids[r] << ",\n";
+        out << "      \"local_rank\": " << local_ranks[r] << ",\n";
+        out << "      \"nrecipients\": " << nrecipients << ",\n";
+        out << "      \"nsenders\": " << nsenders << ",\n";
+        out << "      \"sendsize\": " << sendsize << ",\n";
+        out << "      \"recvsize\": " << recvsize << ",\n";
+        out << "      \"send_bytes\": " << (static_cast<long>(sendsize) * sizeof(double)) << ",\n";
+        out << "      \"recv_bytes\": " << (static_cast<long>(recvsize) * sizeof(double)) << ",\n";
+        out << "      \"send_msg_min\": " << send_msg_min << ",\n";
+        out << "      \"send_msg_max\": " << send_msg_max << ",\n";
+        out << "      \"recv_msg_min\": " << recv_msg_min << ",\n";
+        out << "      \"recv_msg_max\": " << recv_msg_max << ",\n";
+        out << "      \"neighbors_send\": ";
+        write_neighbors(send_data, send_counts[r], send_displs[r]);
+        out << ",\n";
+        out << "      \"neighbors_recv\": ";
+        write_neighbors(recv_data, recv_counts[r], recv_displs[r]);
+        out << "\n";
+        out << "    }" << (r + 1 < num_procs ? "," : "") << "\n";
     }
 
-    out << "  ]\n";                                             // close ranks array
-    out << "}\n";                                                // close top-level object
-    out.close();                                                 // flush and close the file
+    out << "  ]\n";
+    out << "}\n";
+    out.close();
 }
 
 /*
- * save_node_topology
- * --------------------
+ * save_topology
+ * ---------------
  * Inputs:
- *   comm - MPI communicator whose rank-to-node mapping should be recorded.
+ *   A    - distributed matrix whose send_comm/recv_comm hold this rank's
+ *          halo-exchange neighbors (procs) and per-neighbor message sizes
+ *          (counts), as built by form_comm().
+ *   comm - MPI communicator matching A's distribution.
  * Purpose:
- *   Top-level entry point: gathers hostnames across comm, derives node ids
- *   and local ranks, and writes the result to a JSON file so it can be
- *   joined against Caliper profiling output by MPI rank during analysis.
- *   The output path defaults to "node_topology.json" and can be overridden
- *   with the NODE_TOPOLOGY_FILE environment variable. Every rank must call
- *   this function, since MPI_Allgather is collective; only rank 0 performs
- *   the actual file write.
+ *   Top-level entry point combining node placement (which physical node
+ *   each rank ran on) with communication topology (which ranks it
+ *   exchanges halo data with, and how much) into a single JSON file, so
+ *   it can be joined against Caliper profiling output by MPI rank during
+ *   analysis. The output path defaults to "topology.json" and can be
+ *   overridden with the TOPOLOGY_FILE environment variable. Every rank
+ *   must call this function, since the gathers are collective; only
+ *   rank 0 performs the actual file write.
  */
-void save_node_topology(MPI_Comm comm) {
-    int rank;                                                    // this process's rank in comm
-    MPI_Comm_rank(comm, &rank);                                   // populate rank
+void save_topology(ParMat& A, MPI_Comm comm) {
+    int rank, num_procs;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &num_procs);
 
-    // Collective: every rank must reach this call; result is identical everywhere.
-    std::vector<std::string> hostnames = gather_hostnames(comm);   // rank -> hostname table
+    // Node placement: hostname -> node_id/local_rank, replicated on every rank.
+    std::vector<std::string> hostnames = gather_hostnames(comm);
+    std::vector<int> node_ids, local_ranks;
+    assign_node_ids(hostnames, node_ids, local_ranks);
 
-    std::vector<int> node_ids;                                    // rank -> node id table, filled below
-    std::vector<int> local_ranks;                                 // rank -> local rank table, filled below
-    assign_node_ids(hostnames, node_ids, local_ranks);             // local computation, no further communication needed
+    // Per-rank communication summary stats: fixed size, so a plain MPI_Gather suffices.
+    CommStats stats = compute_comm_stats(A);
+    int local_stats[8] = {
+        stats.nrecipients, stats.nsenders, stats.sendsize, stats.recvsize,
+        stats.send_msg_min, stats.send_msg_max, stats.recv_msg_min, stats.recv_msg_max
+    };
+    std::vector<int> all_stats(static_cast<size_t>(num_procs) * 8);
+    MPI_Gather(local_stats, 8, MPI_INT, all_stats.data(), 8, MPI_INT, 0, comm);
 
-    // Resolve output filename: environment variable overrides the default.
-    std::string filename = "node_topology.json";                  // default path
-    const char* env_filename = std::getenv("NODE_TOPOLOGY_FILE");  // check for override
-    if (env_filename) {                                             // if the variable is set,
-        filename = env_filename;                                     // use it instead of the default
+    // Per-rank neighbor lists: variable size, so Gather (sizes) + Gatherv (data).
+    std::vector<int> local_send;
+    for (int i = 0; i < A.send_comm.n_msgs; ++i) {
+        local_send.push_back(A.send_comm.procs[i]);
+        local_send.push_back(A.send_comm.counts[i]);
+    }
+    std::vector<int> local_recv;
+    for (int i = 0; i < A.recv_comm.n_msgs; ++i) {
+        local_recv.push_back(A.recv_comm.procs[i]);
+        local_recv.push_back(A.recv_comm.counts[i]);
     }
 
-    if (rank == 0) {                                               // only one rank should write the file
-        write_topology_json(filename, hostnames, node_ids, local_ranks); // perform the write
+    std::vector<int> send_data, send_counts, send_displs;
+    std::vector<int> recv_data, recv_counts, recv_displs;
+    gather_variable_ints(local_send, comm, send_data, send_counts, send_displs);
+    gather_variable_ints(local_recv, comm, recv_data, recv_counts, recv_displs);
+
+    if (rank == 0) {
+        std::string filename = "topology.json";
+        const char* env_filename = std::getenv("TOPOLOGY_FILE");
+        if (env_filename) filename = env_filename;
+        write_topology_json(filename, hostnames, node_ids, local_ranks, all_stats,
+                             send_data, send_counts, send_displs,
+                             recv_data, recv_counts, recv_displs);
     }
 
-    MPI_Barrier(comm);                                             // ensure the file exists on disk before any rank proceeds
+    MPI_Barrier(comm); // ensure the file exists on disk before any rank proceeds
 }
 
 #endif

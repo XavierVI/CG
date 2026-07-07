@@ -368,12 +368,15 @@ int CG(
 int main(int argc, char* argv[]) {
     // Initialize MPI
     MPI_Init(&argc, &argv);
-    save_node_topology(MPI_COMM_WORLD);
     MPI_Comm adk_comm = MPI_COMM_WORLD;
     adiak::init(&adk_comm);
     // save job ID
     adiak::value("run_id", getenv("FLUX_JOB_ID") ? getenv("FLUX_JOB_ID") : "unknown");
-    adiak::value("batch_id", getenv("FLUX_BATCH_JOB_ID") ? getenv("FLUX_BATCH_JOB_ID") : "unknown");
+    // save MPI configs
+    adiak::value("FI_CXI_RDZV_THRESHOLD", getenv("FI_CXI_RDZV_THRESHOLD") ? getenv("FI_CXI_RDZV_THRESHOLD") : "unknown");
+    adiak::value("FI_CXI_RX_MATCH_MODE", getenv("FI_CXI_RX_MATCH_MODE") ? getenv("FI_CXI_RX_MATCH_MODE") : "unknown");
+    adiak::value("MPICH_GPU_IPC_ENABLED", getenv("MPICH_GPU_IPC_ENABLED") ? getenv("MPICH_GPU_IPC_ENABLED") : "unknown");
+    adiak::value("MPICH_ASYNC_PROGRESS", getenv("MPICH_ASYNC_PROGRESS") ? getenv("MPICH_ASYNC_PROGRESS") : "unknown");
     
     int rank, num_procs;
     double t0, tfinal;
@@ -427,6 +430,8 @@ int main(int argc, char* argv[]) {
 
     if (rank == 0) printf("Form comm: %e\n", tfinal);
     fflush(stdout);
+
+    save_topology(A, MPI_COMM_WORLD); // defined in hip_sparse_mat.hpp
 
     /*
       Copy matrix to device and initialize dense vector buffers
@@ -557,25 +562,34 @@ int main(int argc, char* argv[]) {
     */
     double norm_r;
     int max_iter = 500;
-    double sum;
 
     // synchronize MPI processes and zero out x_d before starting CG
     MPI_Barrier(MPI_COMM_WORLD);
     HIP_CHECK(hipMemsetAsync(x_d, 0, A.local_cols*sizeof(double), 0));
     HIP_CHECK(hipStreamSynchronize(0));
-    
-    int conv_iters = CG(A, x_d, vec_x, b_d, vec_b, sendbuf, recvbuf, vec_recv, &norm_r, max_iter);
-    spmv(
-        -1.0, A, x_d, vec_x, 1.0, r_d, vec_r,
-        sendbuf, recvbuf, vec_recv
-    );
-    sum = inner_product(
-        A.blas_handle, A.local_rows, r_d,
-        r_d, &local_norm_b, &sum, NULL
-    );
 
-    if (rank == 0) printf("Sum %e\n", sum);
-    if (rank == 0) printf("CG + %s: %d iter, norm %e\n", names[idx], conv_iter, sqrt(sum) / norm_b);
+    int conv_iters = CG(A, x_d, vec_x, b_d, vec_b, sendbuf, recvbuf, vec_recv, &norm_r, max_iter);
+
+    // Recompute the true residual r = b - A*x from the converged solution:
+    // the CG loop's tracked norm_r can drift between recompute_r intervals,
+    // so this is the accurate "how close did we get" measurement.
+    HIP_CHECK(
+        hipMemcpyAsync(
+            r_d, b_d, A.local_rows * sizeof(double),
+            hipMemcpyDeviceToDevice, 0
+        )
+    );
+    HIP_CHECK(hipStreamSynchronize(0));
+    parallel_spmv(-1.0, A, x_d, vec_x, 1.0, r_d, vec_r, sendbuf, recvbuf, vec_recv);
+
+    double final_residual = sqrt(inner_product(A.blas_handle, A.local_rows, r_d, r_d));
+    double norm_b = sqrt(inner_product(A.blas_handle, A.local_rows, b_d, b_d));
+    double relative_residual = (norm_b != 0.0) ? final_residual / norm_b : final_residual;
+
+    // save convergence results, in the same manner as run_id/batch_id above
+    adiak::value("converged_iters", conv_iters);
+    adiak::value("max_iters", max_iter);
+    adiak::value("relative_residual", relative_residual);
 
     if (rank == 0)
     {
@@ -583,7 +597,8 @@ int main(int argc, char* argv[]) {
             printf("Max Iterations Reached.\n");
         else
             printf("%d Iterations required to converge\n", conv_iters);
-        printf("2 Norm of Residual: %lg\n\n", norm_r);
+        printf("2 Norm of Residual: %lg\n", norm_r);
+        printf("Relative Residual ||b-Ax||/||b||: %e\n\n", relative_residual);
     }
 
 
