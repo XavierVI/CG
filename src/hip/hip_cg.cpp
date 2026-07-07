@@ -373,11 +373,14 @@ int main(int argc, char* argv[]) {
     // save job ID
     adiak::value("run_id", getenv("FLUX_JOB_ID") ? getenv("FLUX_JOB_ID") : "unknown");
     // save MPI configs
+    adiak::value("nodes", getenv("FLUX_JOB_NNODES") ? getenv("FLUX_JOB_NNODES") : "unknown");
+    adiak::value("procs", getenv("FLUX_JOB_SIZE") ? getenv("FLUX_JOB_SIZE") : "unknown");
     adiak::value("FI_CXI_RDZV_THRESHOLD", getenv("FI_CXI_RDZV_THRESHOLD") ? getenv("FI_CXI_RDZV_THRESHOLD") : "unknown");
     adiak::value("FI_CXI_RX_MATCH_MODE", getenv("FI_CXI_RX_MATCH_MODE") ? getenv("FI_CXI_RX_MATCH_MODE") : "unknown");
     adiak::value("MPICH_GPU_IPC_ENABLED", getenv("MPICH_GPU_IPC_ENABLED") ? getenv("MPICH_GPU_IPC_ENABLED") : "unknown");
     adiak::value("MPICH_ASYNC_PROGRESS", getenv("MPICH_ASYNC_PROGRESS") ? getenv("MPICH_ASYNC_PROGRESS") : "unknown");
-    
+    adiak::value("sparse_matrix", getenv("MATRIX") ? getenv("MATRIX") : "unknown");
+
     int rank, num_procs;
     double t0, tfinal;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -401,6 +404,13 @@ int main(int argc, char* argv[]) {
     */
     const char* filename = "../matrices/Dubcova2.petsc";
     if (argc > 1) filename = argv[1];
+    if (argc > 2) {
+        // interpret the third argument as the max iterations
+        int max_iter = atoi(argv[2]);
+    }
+    else {
+        int max_iter = 500;
+    }
     
 
     ParMat A;
@@ -561,7 +571,6 @@ int main(int argc, char* argv[]) {
       TODO: add code to run multiple iterations and time them
     */
     double norm_r;
-    int max_iter = 500;
 
     // synchronize MPI processes and zero out x_d before starting CG
     MPI_Barrier(MPI_COMM_WORLD);

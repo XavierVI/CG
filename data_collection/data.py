@@ -5,8 +5,7 @@ import polars as pl
 
 """
 SCHEMA raw perf data table:
-- run_id: varchar         This is actually the ID used with flux run/submit,
-- batch_job_id: varchar
+- run_id: varchar         This is actually the ID used with flux run/submit
 - mpi.rank: int
 - sum#sum#time.duration: double
 - min#aggregate.slot: int
@@ -22,10 +21,10 @@ SCHEMA raw perf data table:
 
 
 SCHEMA metadata table:
-- file_name: varchar
-- batch_job_id: varchar
+- run_id: varchar
 - procs: int
 - nodes: int
+- ppn: int
 - RDZV: int
 - MATCH_MODE: int (software = 0, hardware = 1, hybrid = 2)
 - GPU_IPC: int
@@ -59,7 +58,13 @@ print(reader.attributes())
 # print(dir(reader.attribute('run_id')))
 # print(reader.attribute('run_id').metadata())
 print(reader.globals['run_id'])
-# print(reader.globals['uri_id'])
+print(reader.globals['nodes'])
+print(reader.globals['procs'])
+print(reader.globals['FI_CXI_RDZV_THRESHOLD'])
+print(reader.globals['FI_CXI_RX_MATCH_MODE'])
+print(reader.globals['MPICH_GPU_IPC_ENABLED'])
+print(reader.globals['MPICH_ASYNC_PROGRESS'])
+print(reader.globals['sparse_matrix'])
 
 
 data_df = pl.DataFrame(reader.records)
