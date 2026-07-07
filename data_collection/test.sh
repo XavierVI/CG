@@ -14,6 +14,6 @@ MATRIX=$HOME/workspace/CG/matrices/Flan_1565.petsc
 # MATRIX=$PWD/../src/Dubcova2.pm
 
 # caliper configs
-export CALI_CONFIG="runtime-profile(output=cg_solver.cali,profile.mpi,mpi.message.count,mpi.message.size)"
+export CALI_CONFIG="runtime-profile(output=cg_solver.cali,profile.mpi,mpi.message.count,mpi.message.size,mpi.include=MPI_Allreduce,MPI_Barrier,MPI_Waitall,MPI_Isend,MPI_Irecv)"
 
 flux run -N 1 -n 2 -g 1 ../build/hip-cg $MATRIX

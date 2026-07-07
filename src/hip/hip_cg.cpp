@@ -3,10 +3,21 @@
 #include "hip_utils.hpp"
 #include <math.h>
 #include <random>
-
+#include <caliper/cali.h>
+// #include <caliper/cali-manager.h>
 
 // NOTE: this file is a work in progress for combining hip computation and point to point communication (which exists in two difference branches as no one seperated the code into different files, just over wrote the original code)
 
+/* 
+This is a kernel is used to pack the elements of a device vector x
+into a contiguous buffer.
+
+@args
+- x: input vector (device pointer)
+- idx: device pointer to array of indices for the elements of x to pack
+- packed_buf: buffer to store the data to be sent (device pointer)
+- n: number of messages to pack
+*/
 __global__ void pack(
     const double* __restrict__ x,
     const int* __restrict__ idx,
@@ -52,7 +63,7 @@ void local_spmv(
 
 
 /**
-Parallel SpMV: b = alpha*A*x + beta*b (point to point version).
+Parallel SpMV: b = alpha*A*x + beta*b (point-to-point version).
 
 @args
 - alpha: scalar multiplier for A*x
@@ -71,19 +82,23 @@ void parallel_spmv(
     double beta, double* b_d, rocsparse_dnvec_descr vec_b,
     double* sendbuf, double* recvbuf, rocsparse_dnvec_descr vec_recv
 ) {
+    CALI_CXX_MARK_FUNCTION;
     int proc, start, end;
     int tag = 0;
 
     // Launch Pack Kernel -- Pack Send Buffer
+    // if the number of messages we need to send is not zero,
     if (A.send_comm.size_msgs) {
         dim3 threads(256);
         dim3 blocks((A.send_comm.size_msgs + threads.x - 1) / threads.x);
+        // start up the pack kernel
         pack<<<blocks, threads, 0, 0>>>(
             x_d,
             (const int*)A.send_comm.d_idx,
             sendbuf,
             A.send_comm.size_msgs
         );
+        // synchronize
         HIP_CHECK(hipStreamSynchronize(0));
     }
 
@@ -119,7 +134,8 @@ void parallel_spmv(
         );
     }
 
-    // Perform local computation while communication is in flight
+    // Perform local computation while communication
+    // is being performed
     local_spmv(
         A.sparse_handle,
         A.d_on_proc.descr,
@@ -132,17 +148,15 @@ void parallel_spmv(
     );
 
     // Wait for all communication to complete
-    if (A.recv_comm.n_msgs)
-    {
+    if (A.recv_comm.n_msgs) {
         MPI_Waitall(A.recv_comm.n_msgs, A.recv_comm.req.data(), MPI_STATUSES_IGNORE);
     }
 
-    if (A.send_comm.n_msgs)
-    {
+    if (A.send_comm.n_msgs) {
         MPI_Waitall(A.send_comm.n_msgs, A.send_comm.req.data(), MPI_STATUSES_IGNORE);
     }
 
-    // Perform off-process computation with received halo data
+    // Perform off-process computation with received data
     local_spmv(
         A.sparse_handle,
         A.d_off_proc.descr,
@@ -165,8 +179,7 @@ Parallel inner product of two device vectors using rocBLAS ddot + MPI_Allreduce.
 - a_d: device pointer to first vector
 - b_d: device pointer to second vector
 */
-double inner_product(rocblas_handle handle, int n, double* a_d, double* b_d)
-{
+double inner_product(rocblas_handle handle, int n, double* a_d, double* b_d) {
     double local_sum, global_sum;
     rocblas_ddot(handle, n, a_d, 1, b_d, 1, &local_sum);
     HIP_CHECK(hipStreamSynchronize(0));
@@ -184,8 +197,7 @@ AXPY on device: x = x + alpha * y using rocBLAS daxpy.
 - x_d: device pointer to output vector (updated in-place)
 - y_d: device pointer to input vector
 */
-void axpy(rocblas_handle handle, int n, double alpha, double* x_d, double* y_d)
-{
+void axpy(rocblas_handle handle, int n, double alpha, double* x_d, double* y_d) {
     rocblas_daxpy(handle, n, &alpha, y_d, 1, x_d, 1);
     HIP_CHECK(hipStreamSynchronize(0));
 }
@@ -199,8 +211,7 @@ Scale a device vector in-place: x = alpha * x using rocBLAS dscal.
 - alpha: scalar multiplier
 - x_d: device pointer to vector (updated in-place)
 */
-void scale(rocblas_handle handle, int n, double alpha, double* x_d)
-{
+void scale(rocblas_handle handle, int n, double alpha, double* x_d) {
     rocblas_dscal(handle, n, &alpha, x_d, 1);
     HIP_CHECK(hipStreamSynchronize(0));
 }
@@ -226,6 +237,7 @@ int CG(
     double* sendbuf, double* recvbuf, rocsparse_dnvec_descr vec_recv,
     double* final_norm, int max_iter
 ) {
+    CALI_CXX_MARK_FUNCTION;
     std::vector<double> res;
     int rank, num_procs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -255,24 +267,32 @@ int CG(
         )
     );
 
-    int iter, recompute_r;
+    int iter = 0;
+    int recompute_r = 8; // how often to recompute r
     double alpha, beta;
     double rr_inner, next_inner, App_inner;
     double norm_r, tol = 1e-6;
 
     // r0 = b - A * x0
     HIP_CHECK(
-        hipMemcpyAsync(r, b, A.local_rows*sizeof(double),
-            hipMemcpyDeviceToDevice, 0));
+        hipMemcpyAsync(
+            r, b, A.local_rows * sizeof(double),
+            hipMemcpyDeviceToDevice, 0
+        )
+    );
     HIP_CHECK(hipStreamSynchronize(0));
     parallel_spmv(-1.0, A, x, vec_x, 1.0, r, vec_r, sendbuf, recvbuf, vec_recv);
 
     // p0 = r0
-    HIP_CHECK(hipMemcpyAsync(p, r, A.local_rows*sizeof(double),
-            hipMemcpyDeviceToDevice, 0));
+    HIP_CHECK(
+        hipMemcpyAsync(
+            p, r, A.local_rows * sizeof(double),
+            hipMemcpyDeviceToDevice, 0
+        )
+    );
     HIP_CHECK(hipStreamSynchronize(0));
 
-    // Find initial (r, r) and residual
+    // Find initial dot(r, r) and residual
     rr_inner = inner_product(A.blas_handle, A.local_rows, r, r);
     norm_r = sqrt(rr_inner);
     res.push_back(norm_r);
@@ -280,13 +300,9 @@ int CG(
     // Scale tolerance by norm_r
     if (norm_r != 0.0) tol = tol * norm_r;
 
-    // How often should r be recomputed
-    recompute_r = 8;
-    iter = 0;
-
     // Main CG Loop
     while (norm_r > tol && iter < max_iter) {
-        // alpha_i = (r_i, r_i) / (A*p_i, p_i)
+        // alpha_i = inner_prod(r_i, r_i) / inner_prod(A*p_i, p_i)
         parallel_spmv(1.0, A, p, vec_p, 0.0, Ap, vec_Ap, sendbuf, recvbuf, vec_recv);
         App_inner = inner_product(A.blas_handle, A.local_rows, Ap, p);
         
@@ -306,8 +322,12 @@ int CG(
         }
         else {
             // Periodically recompute r from scratch to avoid floating point drift
-            HIP_CHECK(hipMemcpyAsync(r, b, A.local_rows*sizeof(double),
-                    hipMemcpyDeviceToDevice, 0));
+            HIP_CHECK(
+                hipMemcpyAsync(
+                    r, b, A.local_rows * sizeof(double),
+                    hipMemcpyDeviceToDevice, 0
+                )
+            );
             HIP_CHECK(hipStreamSynchronize(0));
             parallel_spmv(-1.0, A, x, vec_x, 1.0, r, vec_r, sendbuf, recvbuf, vec_recv);
         }
@@ -347,10 +367,24 @@ int CG(
 int main(int argc, char* argv[]) {
     // Initialize MPI
     MPI_Init(&argc, &argv);
+    save_node_topology(MPI_COMM_WORLD);
+    
     int rank, num_procs;
     double t0, tfinal;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+
+    // initialize Caliper
+    // cali::ConfigManager mgr;
+    // mgr.add("mpi-report");
+    // const char* cfg = std::getenv("CALI_CONFIG");
+    // if (cfg) mgr.add(cfg);
+    // if (mgr.error()) {
+    //     std::cerr << "Caliper config error: " << mgr.error_msg() << std::endl;
+    // }
+    // mgr.start();
+
+    CALI_CXX_MARK_FUNCTION;
 
     /*
       Read in the matrix
@@ -358,6 +392,7 @@ int main(int argc, char* argv[]) {
     */
     const char* filename = "../matrices/Dubcova2.petsc";
     if (argc > 1) filename = argv[1];
+    
 
     ParMat A;
     MPI_Barrier(MPI_COMM_WORLD);
@@ -516,6 +551,8 @@ int main(int argc, char* argv[]) {
     */
     double norm_r;
     int max_iter = 500;
+
+    // synchronize MPI processes and zero out x_d before starting CG
     MPI_Barrier(MPI_COMM_WORLD);
     HIP_CHECK(hipMemsetAsync(x_d, 0, A.local_cols*sizeof(double), 0));
     HIP_CHECK(hipStreamSynchronize(0));
@@ -544,6 +581,7 @@ int main(int argc, char* argv[]) {
     HIP_CHECK(hipFree(sendbuf));
     HIP_CHECK(hipFree(recvbuf));
 
+    // mgr.flush();
     MPI_Finalize();
     return 0;
 }
