@@ -13,5 +13,7 @@ export MPICH_GPU_SUPPORT_ENABLED=1
 MATRIX=$HOME/workspace/CG/matrices/Flan_1565.petsc
 # MATRIX=$PWD/../src/Dubcova2.pm
 
+# caliper configs
+export CALI_CONFIG="runtime-profile(output=cg_solver.cali,profile.mpi,mpi.message.count,mpi.message.size)"
 
 flux run -N 1 -n 2 -g 1 ../build/hip-cg $MATRIX
