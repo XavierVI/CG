@@ -65,6 +65,9 @@ print(reader.globals['FI_CXI_RX_MATCH_MODE'])
 print(reader.globals['MPICH_GPU_IPC_ENABLED'])
 print(reader.globals['MPICH_ASYNC_PROGRESS'])
 print(reader.globals['sparse_matrix'])
+print(reader.globals['max_iters'])
+print(reader.globals['converged_iters'])
+print(reader.globals['relative_residual'])
 
 
 data_df = pl.DataFrame(reader.records)

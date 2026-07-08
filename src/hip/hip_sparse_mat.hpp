@@ -495,6 +495,8 @@ void write_topology_json(const std::string& filename,
     }
 
     // Emits a JSON array of {rank, count, bytes} for one rank's neighbor list.
+    // count is the number of doubles, bytes is count*sizeof(double)
+    // per exchange
     auto write_neighbors = [&out](const std::vector<int>& data, int count, int displ) {
         int n_entries = count / 2; // each entry is (neighbor_rank, n_doubles)
         out << "[";
