@@ -5,6 +5,7 @@ import itertools
 from pathlib import Path
 # from scipy.stats import qmc
 
+import polars as pl
 
 # matrices_paths = Path("../mat_binary_files")
 matrices_paths = Path("../matrices")
@@ -67,6 +68,31 @@ def fetch_number_of_nodes(node_list):
 
     return node_counts
 
+
+
+def write_commands_to_file(commands, filename):
+    print(f"Generating {len(commands)} commands for aCG...")
+    
+    with open(filename, 'w') as f:
+        f.write('#!/bin/bash\n')
+        f.write('set -e\n')
+
+        for i, cmd in enumerate(commands):
+            f.write(cmd + '\n')
+
+            if (i + 1) % 50 == 0:
+                # wait every 50 jobs
+                f.write("\n")
+                f.write("flux job wait --all\n")
+                f.write("python data.py --logs=./ --db=$HOME/data/acg_results.duckdb --table=acg_runs --append\n")
+                # clean up the output directory
+                f.write("rm halo_stats_*.log halo_stats_*.json\n")
+                f.write("\n")
+
+        # f.write("flux watch --all\n")
+        # f.write("flux job wait --all\n")
+
+
 def generate_cmds(args):
     iterations = [i for i in range(args.min_iterations, args.max_iterations + 1, 100)]
     cxi_thresholds, cxi_rx_match_modes, mpich_gpu_ipc_enabled, mpich_async_progresses = get_mpi_env_params()
@@ -97,7 +123,7 @@ def generate_cmds(args):
     # NOTE: for now, we will just keep it at 4 tasks per node
     # to use as many GPUs as possible
     cmd_base = f"flux submit --flags=waitable -n {args.num_procs} -N {args.num_nodes} -x"
-    script = "aCG_wrapper.sh"
+    script = "cg_wrapper.sh"
 
     commands = []
     
@@ -117,27 +143,44 @@ def generate_cmds(args):
 
         commands.append(cmd)
 
+    write_commands_to_file(commands, "cg_commands.sh")
 
-    print(f"Generating {len(commands)} commands for aCG...")
-    
-    with open('acg_commands.sh', 'w') as f:
-        f.write('#!/bin/bash\n')
-        f.write('set -e\n')
 
-        for i, cmd in enumerate(commands):
-            f.write(cmd + '\n')
+def generate_custom_cmds(args):
+    if args.param_file is None:
+        raise ValueError("Error: --param_file must be specified for custom command generation.")
 
-            if (i + 1) % 50 == 0:
-                # wait every 50 jobs
-                f.write("\n")
-                f.write("flux job wait --all\n")
-                f.write("python data.py --logs=./ --db=$HOME/data/acg_results.duckdb --table=acg_runs --append\n")
-                # clean up the output directory
-                f.write("rm halo_stats_*.log halo_stats_*.json\n")
-                f.write("\n")
+    commands = []
+    cmd_base = f"flux submit --flags=waitable -x"
+    run_script = "cg_wrapper.sh"
+    # read parameters CSV using polars
+    cols = [
+        'procs', 'nodes', 'rdzv', 'match_mode', 'gpu_ipc', 'async', 'max_iters', 'matrix'
+    ]
+    params = pl.read_csv(args.param_file)
+    # use select to ensure ordering
+    params = params.select(cols)
 
-        # f.write("flux watch --all\n")
-        # f.write("flux job wait --all\n")
+    for row in params.iter_rows():
+        procs = row[0]
+        nodes = row[1]
+        rdzv = row[2]
+        match_mode = row[3]
+        gpu_ipc = row[4]
+        async_progress = row[5]
+        max_iters = row[6]
+        matrix = row[7]
+
+        tasks_per_node = max(procs // nodes, 1)
+        
+        cmd = (f"{cmd_base} -n {procs} -N {nodes} {run_script} "
+            f"{rdzv} {match_mode} {gpu_ipc} {async_progress} "
+            f"{max_iters} {matrix}"
+        )
+
+        commands.append(cmd)
+
+    write_commands_to_file(commands, "cg_commands.sh")
 
 
 if __name__ == "__main__":
@@ -162,7 +205,14 @@ if __name__ == "__main__":
         "--max-iterations", type=int, default=200,
         help="Maximum number of iterations for CG solver.",
     )
+    parser.add_argument(
+        '--param_file', type=str, default=None,
+        help='Path to a file containing parameter combinations to run (optional).',
+    )
 
     args = parser.parse_args()
-        
-    generate_cmds(args)
+
+    if args.param_file:
+        generate_custom_cmds(args)
+    else:
+        generate_cmds(args)
