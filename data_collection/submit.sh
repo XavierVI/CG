@@ -3,8 +3,8 @@
 #flux: --job-name=cg_test
 #flux: --output=cg_test.out
 #flux: --queue=pdebug
-#flux: --nodes=8
-#flux: --nslots=32
+#flux: --nodes=2
+#flux: --nslots=16
 #flux: --time-limit=10m
 
 
@@ -20,33 +20,34 @@ PROCS=$(( NNODES * 4 ))
 
 # set up the output directory
 export SUBMISSION_DIR=$(pwd)
-export LUSTRE_OUTPUT_DIR=/p/lustre5/$(whoami)/acg_study
+export LUSTRE_OUTPUT_DIR=/p/lustre5/$(whoami)/cg_study
 mkdir -p "$LUSTRE_OUTPUT_DIR"
 
-cp -r $SUBMISSION_DIR/../mat_binary_files/ $LUSTRE_OUTPUT_DIR/..
-cp $SUBMISSION_DIR/aCG_wrapper.sh $LUSTRE_OUTPUT_DIR/
+cp -r $SUBMISSION_DIR/../petsc_matrices/ $LUSTRE_OUTPUT_DIR/..
+cp $SUBMISSION_DIR/cg_wrapper.sh $LUSTRE_OUTPUT_DIR/
 cp $SUBMISSION_DIR/*.py $LUSTRE_OUTPUT_DIR/
+cp $SUBMISSION_DIR/params.csv $LUSTRE_OUTPUT_DIR/
 
 cd "$LUSTRE_OUTPUT_DIR"
 
 echo "Entered directory: $(pwd)"
 echo "Submission directory: $SUBMISSION_DIR"
-echo "Performing aCG parameter sweep"
+echo "Python virtual environment: $(which python3)"
+echo "Batch Resources:"
 echo "  Nodes: $NNODES"
 echo "  Slots: $PROCS"
 
-python3 generate_cmds.py --num-nodes $NNODES --num-procs $PROCS --min-iterations $MIN_ITERATIONS --max-iterations $MAX_ITERATIONS
+python3 generate_cmds.py --param_file=params.csv
 
 # copy the generated commands to the submission directory
 # for later reference
-cp acg_commands.sh $SUBMISSION_DIR/
+cp cg_commands.sh $SUBMISSION_DIR/
 
-echo "Replication $i/$REPLICATIONS"
-bash acg_commands.sh
+bash cg_commands.sh
     
 # wait for all jobs to complete
 flux job wait --all
 
-python data.py --logs=./ --db=$HOME/data/acg_results.duckdb --table=acg_runs --append
+python data.py --dir=. --db=$HOME/data/cg_results.duckdb
 # clean up the output directory
 rm *.cali *.json

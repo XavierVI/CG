@@ -8,7 +8,7 @@ from pathlib import Path
 import polars as pl
 
 # matrices_paths = Path("../mat_binary_files")
-matrices_paths = Path("../matrices")
+matrices_paths = Path("../petsc_matrices")
 matrices = [
     # matrices_paths / "494_bus.mtx",
     # matrices_paths / "mesh_deform.mtx",
@@ -71,7 +71,7 @@ def fetch_number_of_nodes(node_list):
 
 
 def write_commands_to_file(commands, filename):
-    print(f"Generating {len(commands)} commands for aCG...")
+    print(f"Generating {len(commands)} commands for CG solver...")
     
     with open(filename, 'w') as f:
         f.write('#!/bin/bash\n')
@@ -84,9 +84,9 @@ def write_commands_to_file(commands, filename):
                 # wait every 50 jobs
                 f.write("\n")
                 f.write("flux job wait --all\n")
-                f.write("python data.py --logs=./ --db=$HOME/data/acg_results.duckdb --table=acg_runs --append\n")
+                f.write("python data.py --dir=. --db=$HOME/data/cg_results.duckdb\n")
                 # clean up the output directory
-                f.write("rm halo_stats_*.log halo_stats_*.json\n")
+                f.write("rm *.cali *.json\n")
                 f.write("\n")
 
         # f.write("flux watch --all\n")
@@ -171,9 +171,14 @@ def generate_custom_cmds(args):
         max_iters = row[6]
         matrix = row[7]
 
+        # matrix_path = matrices_paths / matrix
+        # append .petsc to the end
+        # matrix_path = matrix_path.with_suffix(".petsc")
+
         tasks_per_node = max(procs // nodes, 1)
+        log_file = (f"halo_stats_NODES-{nodes}_PROCS-{procs}_RDZV-{rdzv}_MATCH-{match_mode}_IPC-{gpu_ipc}_ASYNC-{async_progress}_ITERATIONS-{max_iters}_MAT-{matrix}.log")
         
-        cmd = (f"{cmd_base} -n {procs} -N {nodes} {run_script} "
+        cmd = (f"{cmd_base} --output={log_file} -n {procs} -N {nodes} {run_script} "
             f"{rdzv} {match_mode} {gpu_ipc} {async_progress} "
             f"{max_iters} {matrix}"
         )
@@ -185,7 +190,7 @@ def generate_custom_cmds(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate flux commands for aCG.",
+        description="Generate flux commands for CG solver.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 

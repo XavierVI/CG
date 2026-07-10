@@ -59,6 +59,7 @@ int readParMatrix(const char* filename, ParMat& A) {
 
     /* open the file and read the header information */
     FILE* ifile = fopen(filename, "rb");
+    printf("Reading matrix from file: %s\n", filename);
     
     // error handling
     if (ifile == NULL) {

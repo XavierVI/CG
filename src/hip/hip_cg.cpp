@@ -402,16 +402,13 @@ int main(int argc, char* argv[]) {
       Read in the matrix
 
     */
+    int max_iter = 500;
     const char* filename = "../matrices/Dubcova2.petsc";
     if (argc > 1) filename = argv[1];
     if (argc > 2) {
         // interpret the third argument as the max iterations
         int max_iter = atoi(argv[2]);
     }
-    else {
-        int max_iter = 500;
-    }
-    
 
     ParMat A;
     MPI_Barrier(MPI_COMM_WORLD);
