@@ -155,7 +155,7 @@ def generate_custom_cmds(args):
     run_script = "cg_wrapper.sh"
     # read parameters CSV using polars
     cols = [
-        'procs', 'nodes', 'rdzv', 'match_mode', 'gpu_ipc', 'async', 'max_iters', 'matrix'
+        'procs', 'nodes', 'RDZV', 'MATCH_MODE', 'GPU_IPC', 'ASYNC', 'max_iters', 'matrix_name'
     ]
     params = pl.read_csv(args.param_file)
     # use select to ensure ordering
